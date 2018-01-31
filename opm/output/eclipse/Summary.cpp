@@ -163,6 +163,7 @@ struct fn_args {
     const EclipseGrid& grid;
     double initial_oip;
     const std::vector<double>& pv;
+    const std::vector< std::pair< std::string, double > > eff_factors;
 };
 
 /* Since there are several enums in opm scattered about more-or-less
@@ -199,7 +200,15 @@ inline quantity rate( const fn_args& args ) {
     for( const auto* sched_well : args.schedule_wells ) {
         const auto& name = sched_well->name();
         if( args.wells.count( name ) == 0 ) continue;
-        const auto v = args.wells.at( name ).rates.get( phase, 0.0 );
+
+        auto it = std::find_if( args.eff_factors.begin(), args.eff_factors.end(),
+                                [&] ( const std::pair< std::string, double > elem ) { return elem.first == name; }
+        );
+
+        double eff_fac = (it != args.eff_factors.end()) ? it->second : 1;
+
+        const auto v = args.wells.at(name).rates.get(phase, 0.0) * eff_fac;
+
         if( ( v > 0 ) == injection )
             sum += v;
     }
@@ -1056,7 +1065,8 @@ Summary::Summary( const EclipseState& st,
                                     {},          // Region <-> cell mappings.
                                     this->grid,
                                     this->initial_oip,
-                                    {} };
+                                    {},
+                                    {}};
 
             const auto val = handle( no_args );
 
@@ -1073,6 +1083,67 @@ Summary::Summary( const EclipseState& st,
     for ( const auto& keyword : unsupported_keywords ) {
         Opm::OpmLog::info("Keyword " + std::string(keyword) + " is unhandled");
     }
+}
+
+std::vector< std::pair< std::string, double > >
+efficiency_factors( const smspec_node_type* type,
+                    const Schedule& schedule,
+                    const std::vector< const Well* >& schedule_wells,
+                    size_t timestep ) {
+    std::vector< std::pair< std::string, double > > efac;
+
+    /* Well Rate (e.g. WOPR)  - No efficiency factor
+     * Well Total (e.g. WOPT) - WEFAC & GEFAC (whole hierarchy)
+     * Group Rate (e.g. GOPR) - WEFAC & GEFAC (only subgroups)
+     * Group Total (e.g. GOPT) - WEFAC & GEFAC (whole hierarchy)
+     * Field Rate (e.g. FOPR) - WEFAC & GEFAC (whole hierarchy)
+     * Field Total (e.g. FOPT) - WEFAC & GEFAC (whole hierarchy)
+     * Region Rate
+     * Region Total */
+    if(    smspec_node_get_var_type(type) != ECL_SMSPEC_GROUP_VAR
+        && smspec_node_get_var_type(type) != ECL_SMSPEC_FIELD_VAR
+        && smspec_node_get_var_type(type) != ECL_SMSPEC_REGION_VAR
+        && !smspec_node_is_total( type ) ) {
+        return efac;
+    }
+
+    const bool is_group = smspec_node_get_var_type(type) == ECL_SMSPEC_GROUP_VAR;
+    const bool is_rate = !smspec_node_is_total( type );
+    const auto &groupTree = schedule.getGroupTree(timestep);
+
+    /* Preferably we would like to use a native validation method ("hasParent")
+     * instead of a try-catch block.
+     * When/if that function is implemented, change the current workflow.*/
+    auto getparent = [&]( const Group* g ) -> decltype( g ) {
+        try {
+            const auto& parent = groupTree.parent( g->name() );
+            if( !schedule.hasGroup( parent ) ) return nullptr;
+            return &schedule.getGroup( parent );
+        }
+        catch( const std::invalid_argument& ) { return nullptr; }
+    };
+
+    for( const auto* well : schedule_wells ) {
+        double eff_factor = well->getEfficiencyFactor(timestep);
+
+        if (!schedule.hasGroup(well->getGroupName(timestep)))
+            continue;
+
+        const auto* node = &schedule.getGroup(well->getGroupName(timestep));
+
+        while(true){
+            if((    is_group
+                 && is_rate
+                 && node->name() == smspec_node_get_wgname(type) ))
+                break;
+            eff_factor *= node->getGroupEfficiencyFactor( timestep );
+            if (!(node = getparent( node )) )
+                break;
+        }
+        efac.emplace_back( well->name(), eff_factor );
+    }
+
+    return efac;
 }
 
 void Summary::add_timestep( int report_step,
@@ -1092,6 +1163,8 @@ void Summary::add_timestep( int report_step,
         const auto* genkey = smspec_node_get_gen_key1( f.first );
 
         const auto schedule_wells = find_wells( schedule, f.first, timestep );
+        auto eff_factors = efficiency_factors( f.first, schedule, schedule_wells, timestep );
+
         const auto val = f.second( { schedule_wells,
                                      duration,
                                      timestep,
@@ -1101,7 +1174,8 @@ void Summary::add_timestep( int report_step,
                                      this->regionCache,
                                      this->grid,
                                      this->initial_oip,
-                                     this->porv});
+                                     this->porv,
+                                     eff_factors});
 
         const auto unit_applied_val = es.getUnits().from_si( val.unit, val.value );
         const auto res = smspec_node_is_total( f.first ) && prev_tstep
